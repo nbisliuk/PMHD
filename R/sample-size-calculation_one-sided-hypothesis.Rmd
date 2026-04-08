@@ -1,0 +1,426 @@
+---
+title: "sample-size-calculation"
+output: html_document
+---
+
+```{r}
+pacman::p_load(dplyr, faux, lmerTest)
+```
+
+# Objective
+
+Set the sample size sufficiently big to detect a 10 point quality score effect in at least one climate setting.
+
+**Conditions**:
+- There are 2 pear species, 4 climate settings and 2 possible locations
+- Each ecotron can accomodate at most 6 trees
+- Preferably the study is carried out solely in Belgium, utilizing at most 12 ecotrons. Hence, the cost-effective study is limited to 72 trees
+- The number of pears per tree is variable and cannot be controlled
+- Expect 10% dropout rate
+
+# Pilot data, BE model
+
+```{r}
+pilot <- read.csv("G16.pilot.data.csv") %>% 
+  mutate(across(-quality_index, factor))
+
+# Model trees grown Belgium
+m1 <- lmer(
+  quality_index ~ species + (1 | tree_id),
+  data = pilot %>% filter(location == "BE")
+)
+summary(m1)
+```
+```{r}
+# Extract parameters to model random number of pears per tree
+pear_counts <- count(pilot, tree_id)$n
+mean_pears <- mean(pear_counts)
+sd_pears <- sd(pear_counts)
+```
+
+```{r}
+# Extract effects from the pilot data model
+intercept     <- fixef(m1)["(Intercept)"]
+species_eff   <- fixef(m1)["speciesDoyenne"]
+sd_tree       <- as.data.frame(VarCorr(m1))$sdcor[1]
+sd_residual   <- as.data.frame(VarCorr(m1))$sdcor[2]
+
+```
+
+# Define simulation function
+
+```{r}
+run_sim <- function(n_trees){
+  
+  # 1. Create a vector of pear counts per tree
+  n_pears_per_tree <- pmax(1, round(rnorm(n_trees, mean = mean_pears, sd = sd_pears)))
+  
+  # 2. Create a dataframe with a row per tree, define:
+  # tree_id, species, climate, random intercept for every tree
+  tree_data <- data.frame(
+    tree_id = seq_len(n_trees),
+    species = c(rep("Conference", n_trees / 2), rep("Doyenne", n_trees / 2)),
+    climate = factor(rep(seq(4), n_trees / 4))
+  ) %>% 
+    mutate(
+      # Add random tree intercept
+      tree_intercept = rnorm(n(), mean = 0, sd = sd_tree)
+    )
+  
+  # 3. Model data for every pear
+  pear_data <- tree_data %>% 
+    tidyr::uncount(weights = n_pears_per_tree) %>% 
+    mutate(
+      epsilon = rnorm(n(), mean = 0, sd = sd_residual),
+      quality_index = intercept +
+        (species == "Doyenne") * species_eff +
+        (climate == 2) * climate_eff +
+        tree_intercept +
+        epsilon
+    )
+  
+  # 4. Fit the model
+  m <- lmer(
+    quality_index ~ species + climate + (1 | tree_id),
+    data = pear_data
+  )
+  
+  # 5. Extract p values for climate terms, adjust with BH procedure
+  coef_table <- summary(m)$coefficients
+  p_vals <- coef_table[grep("climate", rownames(coef_table)), "Pr(>|t|)"]
+  p_vals_adj <- p.adjust(p_vals, method = "BH")
+  
+  # 6. Return if ANY p value is significant
+  any(p_vals_adj < alpha)
+}
+```
+
+# Run simulations
+
+```{r}
+# Set the climate effect to be detected
+climate_eff  <- 10
+alpha        <- 0.05
+target_power <- 0.80
+n_simulations  <- 1000
+
+ssizes <- seq(8, 72, 8)
+```
+
+```{r}
+power <- sapply(ssizes, function(n) {
+  mean(replicate(n_simulations, run_sim(n)))
+})
+
+# --- PLOT ---
+plot(ssizes, power, type = "b", pch = 19,
+     xlab = "Sample size per group",
+     ylab = "Power",
+     main = "Power to detect 10-point effect (BH adjusted)")
+abline(h = 0.8, col = "hotpink", lwd = 2)
+```
+
+
+```{r}
+# Set the climate effect to be detected
+climate_eff   <- 10
+
+# Extract effects from the pilot data model
+intercept     <- fixef(m)["(Intercept)"]
+location_eff  <- fixef(m)["locationFR"]
+species_eff   <- fixef(m)["speciesDoyenne"]
+sd_tree       <- as.data.frame(VarCorr(m))$sdcor[1]
+sd_residual   <- as.data.frame(VarCorr(m))$sdcor[2]
+
+# Extract parameters to model random number of pears per tree
+pear_counts <- count(pilot, tree_id)$n
+mean_pears <- mean(pear_counts)
+sd_pears <- sd(pear_counts)
+
+n_trees <- 12
+n_pears_per_tree <- round(rnorm(n_trees, mean = mean_pears, sd = sd_pears))
+tot_obs <- sum(n_pears_per_tree)
+
+tree_data <- data.frame(
+  tree_id = seq_len(n_trees),
+  species = c(rep("Conference", n_trees / 2), rep("Doyenne", n_trees / 2)),
+  location = c(rep("BE", 72), rep("FR", max(0, n_trees - 72)))[1:n_trees],
+  climate = rep(seq(4), n_trees / 4)
+) %>% 
+  mutate(
+    # Add random tree intercept
+    tree_intercept = rnorm(n(), mean = 0, sd = sd_tree)
+  )
+  tidyr::uncount(weights = n_pears_per_tree) %>% 
+  mutate(
+    epsilon = rnorm(n(), mean = 0, sd = sd_residual),
+    tree_eff = rnorm(n(), mean = 0, sd = sd_tree),
+    quality_score = intercept +
+      if_else(location == "FR", 1, 0) * location_eff +
+      if_else(species == "Doenne", 1, 0) * species_eff +
+      tree_eff +
+      epsilon
+  )
+```
+
+
+```{r}
+intercept     <- 55
+species_eff   <- -6.6
+climate_eff   <- 10        # ← what you want to detect
+sd_tree       <- 2.4
+sd_residual   <- 20.2
+
+library(lme4)
+
+simulate_once <- function(n_trees) {
+  
+  n_obs_per_tree <- round(rnorm(b_trees, mean = mean_pears, sd = sd_pears))
+  
+  data.frame(
+    location = rep(c(0, 1), ),
+    
+  )
+ 
+    
+  add_random(tree = n_trees) %>%
+    mutate(variety = rep(c("v1", "v2"), each = 3, length = 72)) %>%
+    add_random(pear = rbinom(n = 72, size = 31, prob = 0.8), .nested_in = "tree") %>% 
+    mutate(qscore = rnorm(.n, mean = ))
+  # --- Assign predictors at tree level ---
+  climate <- sample(c(0, 1), n_trees, replace = TRUE)
+  species <- sample(c(0, 1), n_trees, replace = TRUE)
+  
+  # --- Random tree effects ---
+  tree_eff <- rnorm(n_trees, 0, sd_tree)
+  
+  # --- Expand to observations ---
+  tree_id <- rep(1:n_trees, each = n_obs_per_tree)
+  climate_obs <- rep(climate, each = n_obs_per_tree)
+  species_obs <- rep(species, each = n_obs_per_tree)
+  tree_eff_obs <- rep(tree_eff, each = n_obs_per_tree)
+  
+  # --- Generate response ---
+  y <- beta_0 +
+       climate_eff * climate_obs +
+       species_eff * species_obs +
+       tree_eff_obs +
+       rnorm(n_trees * n_obs_per_tree, 0, sd_residual)
+  
+  dat <- data.frame(
+    y = y,
+    climate = factor(climate_obs),
+    species = factor(species_obs),
+    tree_id = factor(tree_id)
+  )
+  
+  # --- Fit model (simpler for speed) ---
+  fit <- lm(y ~ climate + species, data = dat)
+  
+  pval <- summary(fit)$coefficients["climate1", "Pr(>|t|)"]
+  
+  return(pval < 0.05)
+}
+```
+
+
+# Old
+
+```{r}
+# If tree 
+model <- lmer(
+  Y ~ climate + variety + climate:variety 
+    (1 | ecotron) +
+    (1 | tree),  # (1 | ecotron:tree) if tree ID is unique within ecotron
+  data = dat
+)
+```
+
+# Simulate the data
+
+25 = n * p
+3.3 = n*p (1-p)
+
+p = 1 - 3.3 / 25 = 0.87
+n = 25 / p = 29
+
+```{r}
+add_random(ecotron = 12) %>%
+  add_random(tree = 6, .nested_in = "ecotron") %>%
+  mutate(variety = rep(c("v1", "v2"), each = 3, length = 72)) %>%
+  add_random(pear = rbinom(n = 72, size = 31, prob = 0.8), .nested_in = "tree") %>% 
+  mutate(qscore = rnorm(.n, mean = ))
+```
+
+```{r}
+add_random(climate = 2) %>%
+  add_random(variety = 2, .nested_in = "climate")
+```
+$$Y_{ijv} = \beta_0 + \beta_j\cdot \text{climate}_j + \beta_v \cdot \text{variety}_v + \beta_{jv} \cdot \text{climate}_j \cdot \text{variety}_v + \varepsilon_{ijv}$$
+
+```{r}
+lm(score ~ variety + climate + climate:variety)
+```
+
+```{r}
+add_random(variety = 2) %>% 
+  add_random(climate = 4) %>% 
+  add_random()
+```
+
+```{r}
+library(broom)
+
+sim_power <- function(n_pears = 25, sd_pear = 5) {
+  # 1. Setup Structure: 2 Ecotrons, 6 Trees each
+  data <- add_random(ecotron = 2) %>%
+    add_condition("ecotron", climate = c("C1", "C2")) %>%
+    add_random(tree = 6, .nested_in = "ecotron") %>%
+    # Split variety 3 vs 3 within each ecotron
+    add_condition("tree", variety = c("V1", "V2")) %>%
+    # Generate varying pear counts
+    add_random(pear = rbinom(nrow(.), 31, 0.8), .nested_in = "tree")
+  
+  # 2. Assign Scores
+  # Let's assume V1 mean = 50, V2 mean = 55 (SD = 5)
+  # Climate C2 adds +10 points
+  data <- data %>%
+    mutate(
+      base_score = ifelse(variety == "V1", 50, 55),
+      clim_eff   = ifelse(climate == "C2", 10, 0),
+      # Interaction: Let's assume V2 reacts 2 points better to C2
+      interact   = ifelse(climate == "C2" & variety == "V2", 2, 0),
+      noise      = rnorm(nrow(.), mean = 0, sd = sd_pear),
+      score      = base_score + clim_eff + interact + noise
+    )
+  
+  # 3. Run the Linear Model
+  model <- lm(score ~ variety * climate, data = data)
+  
+  # 4. Extract P-values
+  res <- tidy(model)
+  # We return TRUE if the climate effect is significant (p < .05)
+  return(res$p.value[res$term == "climateC2"] < 0.05)
+}
+
+# Run 1000 iterations
+sim_results <- replicate(1000, sim_power())
+mean(sim_results) # This is your estimated Power
+```
+
+The simulations will be performed in the following setting:
+- There is 1 ecotron per climate
+- Assume homogeneity in scores between climates
+- Use variance and mean of scores between the two pear varieties
+- Trees of both varieties must be subject to a climate, the design is balanced
+- Adjust the p-values to control for FDR by applying Benjamini-Hochberg procedure
+
+
+
+```{r}
+library(tidyverse)
+
+# --- USER INPUTS ---
+sd <- 8
+mu_var1 <- 70
+mu_var2 <- 60
+climate_eff <- 10
+power <- 0.80
+alpha <- 0.05
+sims <- 100
+ssizes <- seq(4, 50, by = 5)
+
+power <- sapply(ssizes, function(n) {
+  res <- replicate(sims, {
+    
+    df <- expand.grid(variety = c(1, 2), climate = seq(4)) %>%
+      slice(rep(1:n(), each = n)) %>% 
+      mutate(
+        variety = factor(variety),
+        climate = factor(climate),
+        beta_j = if_else(climate == 2, climate_eff + 5, 5),  # diff = 10
+        beta_v = if_else(variety == 1, mu_var1, mu_var2),
+        epsilon = rnorm(nrow(.), mean = 0, sd = sd),
+        score = beta_j + beta_v + epsilon
+      )
+    
+    m <- lm(score ~ variety + climate, data = df)
+    p_vals <- summary(m)$coefficients[3:5, 4]
+    p_vals_adj <- p.adjust(p_vals, method = "BH")
+    
+    any(p_vals_adj < 0.05)
+  })
+  mean(res) # Proportion of successes = Power
+})
+
+# Display results
+plot(ssizes, power)
+abline(h = 0.8, col = "hotpink", lwd = 1.5)
+```
+
+
+```{r}
+library(tidyverse)
+
+# --- PARAMETERS ---
+sd <- 8
+mu <- 60                  # baseline score
+effect_size <- 10         # effect in ONE climate
+alpha <- 0.05
+sims <- 100
+ssizes <- seq(4, 60, by = 4)
+
+# --- FUNCTION TO RUN ONE SIMULATION ---
+run_sim <- function(n) {
+  
+  # balanced design
+  df <- expand.grid(
+    variety = c("A", "B"),
+    climate = factor(1:4)
+  ) %>%
+    slice(rep(1:n(), each = n))
+  
+  # define true effects
+  df <- df %>%
+    mutate(
+      # only climate 1 has a real effect
+      true_effect = if_else(climate == "1" & variety == "A", effect_size, 0),
+      score = mu + true_effect + rnorm(n(), 0, sd)
+    )
+  
+  # fit model with interaction
+  m <- lm(score ~ variety * climate, data = df)
+  
+  coefs <- summary(m)$coefficients
+  
+  # extract p-values for variety effect within each climate
+  # baseline (climate 1)
+  pvals <- c(
+    coefs["varietyB", 4],  # baseline climate
+    
+    # other climates: interaction terms
+    coefs["varietyB:climate2", 4],
+    coefs["varietyB:climate3", 4],
+    coefs["varietyB:climate4", 4]
+  )
+  
+  # BH correction
+  p_adj <- p.adjust(pvals, method = "BH")
+  
+  # success = detect at least one effect
+  any(p_adj < alpha)
+}
+
+# --- POWER CURVE ---
+power <- sapply(ssizes, function(n) {
+  mean(replicate(sims, run_sim(n)))
+})
+
+# --- PLOT ---
+plot(ssizes, power, type = "b", pch = 19,
+     xlab = "Sample size per group",
+     ylab = "Power",
+     main = "Power to detect 10-point effect (BH adjusted)")
+abline(h = 0.8, col = "hotpink", lwd = 2)
+```
+
