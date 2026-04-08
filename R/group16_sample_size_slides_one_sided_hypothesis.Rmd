@@ -1,0 +1,363 @@
+---
+title: "Sample Size Calculation"
+author:
+- Valeriia Kantsypa
+- "Bogdan-Gabriel Șlencu"
+- Mikita Bisliuk
+- Silas Ooko
+subtitle: Group 16
+output:
+  beamer_presentation: default
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+  slidy_presentation: default
+---
+
+```{r setup, include=FALSE}
+required_pkgs <- c("dplyr", "tidyr", "ggplot2", "lmerTest", "knitr", "scales", "here")
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 4.6,
+  fig.align = "center",
+  out.width = "92%",
+  dpi = 150
+)
+
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+set.seed(20260407)
+
+find_input_file <- function(filename) {
+  candidates <- unique(c(
+    filename,
+    file.path(getwd(), filename),
+    if (!is.null(knitr::current_input())) file.path(dirname(normalizePath(knitr::current_input())), filename),
+    file.path("/mnt/data", filename)
+  ))
+  hit <- candidates[file.exists(candidates)][1]
+  if (is.na(hit) || is.null(hit)) {
+    stop(
+      paste0(
+        "Could not find '", filename, "'. Checked: ",
+        paste(candidates, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  hit
+}
+```
+
+```{r calculations, include=FALSE, cache=TRUE}
+pilot <- read.csv(here("data/G16.pilot.data.csv")) %>% 
+  mutate(across(-quality_index, factor))
+
+m1 <- lmer(
+  quality_index ~ species + (1 | tree_id),
+  data = pilot %>% filter(location == "BE")
+)
+
+pear_counts <- count(pilot, tree_id)$n
+mean_pears <- mean(pear_counts)
+sd_pears <- sd(pear_counts)
+
+intercept   <- fixef(m1)["(Intercept)"]
+species_eff <- fixef(m1)["speciesDoyenne"]
+sd_tree     <- as.data.frame(VarCorr(m1))$sdcor[1]
+sd_residual <- as.data.frame(VarCorr(m1))$sdcor[2]
+
+climate_eff   <- 10
+alpha         <- 0.05
+target_power  <- 0.80
+n_simulations <- 1000
+ssizes        <- seq(8, 72, 8)
+#dropout_rate  <- 0.10
+
+run_sim <- function(n_trees) {
+  n_pears_per_tree <- pmax(1, round(rnorm(n_trees, mean = mean_pears, sd = sd_pears)))
+
+  tree_data <- data.frame(
+    tree_id = seq_len(n_trees),
+    species = c(rep("Conference", n_trees / 2), rep("Doyenne", n_trees / 2)),
+    climate = factor(rep(seq(4), n_trees / 4))
+  ) %>%
+    mutate(tree_intercept = rnorm(n(), mean = 0, sd = sd_tree))
+
+  pear_data <- tree_data %>%
+    tidyr::uncount(weights = n_pears_per_tree) %>%
+    mutate(
+      epsilon = rnorm(n(), mean = 0, sd = sd_residual),
+      quality_index = intercept +
+        (species == "Doyenne") * species_eff +
+        (climate == 2) * climate_eff +
+        tree_intercept +
+        epsilon
+    )
+
+  m <- lmer(
+    quality_index ~ species + climate + (1 | tree_id),
+    data = pear_data
+  )
+
+  coef_table <- summary(m)$coefficients
+  p_vals <- coef_table[grep("climate", rownames(coef_table)), "Pr(>|t|)"]
+  t_vals <- coef_table[grep("climate", rownames(coef_table)), "t value"]
+  p_vals_adj <- p.adjust(p_vals, method = "BH")
+  p_vals_adj_one_sided <- if_else(t_vals > 0,
+                             p_vals_adj / 2,
+                             1 - p_vals_adj / 2)
+  any(p_vals_adj_one_sided < alpha)
+}
+
+power <- sapply(ssizes, function(n) mean(replicate(n_simulations, run_sim(n))))
+
+power_tbl <- data.frame(
+  total_trees = ssizes,
+  power = power
+) %>%
+  mutate(
+    meets_target = power >= target_power,
+    power_label = scales::percent(power, accuracy = 0.1)
+  )
+
+recommended_trees <- power_tbl %>%
+  filter(meets_target) %>%
+  slice(1) %>%
+  pull(total_trees)
+
+if (length(recommended_trees) == 0) {
+  recommended_trees <- NA_integer_
+}
+
+#recommended_with_dropout <- if (is.na(recommended_trees)) NA_integer_ else ceiling(recommended_trees / (1 - dropout_rate))
+recommended_with_dropout <- if (is.na(recommended_trees)) NA_integer_ else ceiling(recommended_trees  + 8)
+plot_obj <- ggplot(power_tbl, aes(total_trees, power)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = target_power, linetype = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = ssizes) +
+  labs(
+    x = "Total number of trees",
+    y = "Estimated power"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+pilot_be <- pilot %>% filter(location == "BE")
+
+param_tbl <- data.frame(
+  Quantity = c(
+    "Intercept",
+    "Species effect: Doyenne vs Conference",
+    "Tree-level SD",
+    "Residual SD",
+    "Mean pears per tree",
+    "SD pears per tree"
+  ),
+  Estimate = round(c(intercept, species_eff, sd_tree, sd_residual, mean_pears, sd_pears), 2)
+)
+
+show_tbl <- power_tbl %>%
+  transmute(
+    `Total trees` = total_trees,
+    `Estimated power` = power_label,
+    `Meets 80% target` = ifelse(meets_target, "Yes", "No")
+  )
+```
+
+## Objective
+
+The **goal:** is to choose a sample size large enough to detect a **10-point quality score effect** in at least one climatic condition.
+
+**Study constraints from the analysis file**
+
+- 2 pear species: Conference and Doyenné du Comice
+- 4 climate settings
+- 2 possible locations: France and Belguim 
+- Preferably the study is carried out solely in Belgium
+- 12 ecotrons available in Belgium
+- 6 trees can be planted in an ecotron
+- Therefore, the cost-effective design is limited to **72 trees**
+- Number of pears per tree is variable and cannot be controlled
+
+## Why simulation was used
+
+The chosen approach was **simulation-based power analysis**, informed by the pilot data.
+
+A simple closed-form sample size formula was not appropriate because:
+
+- pears are nested within trees,
+- trees differ from each other,
+- the number of pears per tree varies,
+- climate is represented by several model coefficients.
+
+The analysis therefore keeps the planned data-generating structure and estimates power empirically.
+
+## Modeling strategy
+
+Focus only on Belgian data (no location effect, cost-effectiveness)
+
+Use a mixed-effects model:
+
+- Fixed effects: species + climate
+- Random effect: tree
+
+From pilot data, estimate:
+
+- Intercept and species effect
+- Variability between trees (random effect SD)
+- Residual variability
+
+
+The number of pears per tree cannot be controlled >> the number of observations per tree is simulated, not fixed.
+
+## Pilot model for parameter extraction
+
+We utilized the pilot data to estimate the following parameters:
+
+- Intercept $\beta_0$
+- Species effect $\beta_1$
+- Standard deviation of the tree random intercept $\sigma_\text{tree}$
+
+The pilot model fitted in the calculation file:
+
+$$
+\text{Quality Index}_{it} = \beta_0 + \beta_1 \cdot \text{Species} + b_t + \varepsilon_{it}
+$$
+where
+
+- $\text{Species}$ is a dummy variable, specifying Doyenne trees
+- $b_{t}$ a random intercept for tree $t$
+- $b_t \sim N(0, \sigma^2_{tree}), \qquad \varepsilon_{ijt} \sim N(0, \sigma^2_{residual})$
+
+This model was fitted on the **Belgium subset** of the pilot data.
+
+## Modeling random number of pears per tree
+
+To account for random number of pears per tree within simulations we estimated:
+
+- Mean number of pears per tree $\mu_n$
+- Variance of the number of pears per tree $\sigma^2_n$
+
+on the **full** pilot dataset with 16 trees.
+
+The number of pears from tree $t$ was modeled as:
+
+$$
+N_t = \max\left[1,\ round \big( \ N(\hat\mu_n, \hat\sigma^2_n \ )\big)\right]
+$$
+
+## Summary of parameters estimated with pilot data
+
+```{r parameter_table}
+knitr::kable(param_tbl, align = c("l", "r"))
+```
+
+## Simulation approach
+
+1. Model the number of observations per tree
+2. Simulate Quality Index ($\text{QI}$) for each pear
+
+$$
+\text{QI}_{it} = \hat\beta_0 + \text{Species}\cdot\hat\beta_{1} + \text{Climate} \cdot \beta_\text{climate} + \hat b_t + \hat\varepsilon_{it}
+$$
+
+- $\text{Species}$ is a dummy variable, specifying Doyenne trees
+- $\text{Climate}$ is a dummy variable, specifying the trees under Climate #2
+- The target effect fixed at $\beta_\text{climate} = 10$
+
+3. Fit the model
+
+$$
+quality\_index \sim species + climate + (1 \mid tree\_id)
+$$
+
+## Simulation approach
+
+1. Model the number of observations per tree
+2. Simulate Quality Index ($\text{QI}$) for each pear
+
+$$
+\text{QI}_{it} = \hat\beta_0 + \text{Species}\cdot\hat\beta_{1} + \text{Climate} \cdot \beta_\text{climate} + \hat b_t + \hat\varepsilon_{it}
+$$
+
+- $\text{Species}$ is a dummy variable, specifying Doyenne trees
+- $\text{Climate}$ is a dummy variable, specifying the trees under Climate #2
+- The target effect fixed at $\beta_\text{climate} = 10$
+
+3. Fit the model
+
+$$
+quality\_index \sim species + climate + (1 \mid tree\_id)
+$$
+
+## Simulation approach cont.
+
+5. Extract p values for climate terms
+6. Apply Benjamini-Hochberg procedure to the climate p values
+7. Mark the iteration as True Positive if **at least one adjusted p value for climate effect** is below $\alpha = 0.05$
+8. For each of the sample size tested, repeat the simulation procedure $R=1000$ times.
+
+The estimated power is the fraction of True Positives:
+
+$$
+\widehat{Power} = \frac{1}{R} \sum_{r=1}^{R} I(\text{at least one adjusted climate p-value is significant})
+$$
+
+## Results: Estimated power by total number of trees
+
+We run simulations over sample sizes starting from minimum of $8$ trees ($4\ \text{climates} \times 2 \ \text{species}$) to a maximum of $72$ with a step of $8$ trees for balanced design.
+
+```{r power_table_slide}
+knitr::kable(show_tbl, align = c("r", "r", "c"))
+```
+
+## Results: Power curve
+
+**Power to detect a 10-point climate effect using the existing simulation approach**
+
+```{r power_plot, fig.height=4.0, out.width='88%'}
+print(plot_obj)
+```
+
+## Results: Recommended sample size
+
+```{r recommendation_text, results='asis'}
+if (is.na(recommended_trees)) {
+  cat("<p><strong>No sample size up to 72 trees reached 80% estimated power.</strong></p>")
+} else {
+  cat(
+    paste0(
+      "<p><strong>First sample size reaching 80% power:</strong> ",
+      recommended_trees,
+      " total trees.</p>"
+    )
+  )
+}
+
+if (is.na(recommended_with_dropout)) {
+  cat("<p><strong>Dropout-adjusted target:</strong> not available because the target power was not reached in the tested range.</p>")
+} else {
+  cat(
+    paste0(
+      "<p><strong>After dropout inflation:</strong> ",
+      recommended_with_dropout,
+      " trees.</p>"
+    )
+  )
+}
+```
