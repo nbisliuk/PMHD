@@ -57,54 +57,87 @@ find_input_file <- function(filename) {
 }
 ```
 
-```{r calculations, include=FALSE, cache=TRUE}
+```{r}
 pilot <- read.csv(here("data/G16.pilot.data.csv")) %>% 
   mutate(across(-quality_index, factor))
 
-m1 <- lmer(
-  quality_index ~ species + (1 | tree_id),
-  data = pilot %>% filter(location == "BE")
+head(pilot)
+
+pilot_be <- filter(pilot, location == "BE")
+```
+
+
+```{r}
+pilot_model <- lmer(
+  quality_index ~ species + (1 | ecotr_id / tree_id), data = pilot, REML = FALSE
 )
 
+summary(pilot_model)
+```
+
+
+```{r calculations, include=FALSE, cache=TRUE}
 pear_counts <- count(pilot, tree_id)$n
 mean_pears <- mean(pear_counts)
 sd_pears <- sd(pear_counts)
 
-intercept   <- fixef(m1)["(Intercept)"]
-species_eff <- fixef(m1)["speciesDoyenne"]
-sd_tree     <- as.data.frame(VarCorr(m1))$sdcor[1]
-sd_residual <- as.data.frame(VarCorr(m1))$sdcor[2]
+# Fixed effects
+intercept   <- fixef(pilot_model)["(Intercept)"]
+species_eff <- fixef(pilot_model)["speciesDoyenne"]
+
+# Get variance components
+varcomp <- as.data.frame(VarCorr(pilot_model))
+sd_ecotron <- varcomp$sdcor[1]  # ecotr_id
+sd_tree    <- varcomp$sdcor[2]  # tree_id:ecotr_id  
+sd_residual <- varcomp$sdcor[3] # residuals
+
 
 climate_eff   <- 10
 alpha         <- 0.05
-target_power  <- 0.80
+target_power  <- 0.85
 n_simulations <- 1000
-ssizes        <- seq(8, 72, 8)
+
 #dropout_rate  <- 0.10
 
-run_sim <- function(n_trees) {
+run_sim <- function(n_ecotrons, n_trees_per_ecotron) {
+  
+  n_trees <- n_ecotrons * n_trees_per_ecotron
   n_pears_per_tree <- pmax(1, round(rnorm(n_trees, mean = mean_pears, sd = sd_pears)))
-
-  tree_data <- data.frame(
-    tree_id = seq_len(n_trees),
-    species = c(rep("Conference", n_trees / 2), rep("Doyenne", n_trees / 2)),
-    climate = factor(rep(seq(4), n_trees / 4))
+  
+  ecotron_data <- data.frame(
+    ecotr_id = 1:n_ecotrons,
+    climate = factor(rep(1:4, length.out = n_ecotrons))
   ) %>%
-    mutate(tree_intercept = rnorm(n(), mean = 0, sd = sd_tree))
+    mutate(
+      ecotron_effect = rnorm(n_ecotrons, 0, sd_ecotron)
+    )
+  
+  tree_data <- ecotron_data %>%
+    tidyr::uncount(weights = n_trees_per_ecotron) %>% 
+    mutate(
+    tree_id = row_number(),
+    species = rep(c("Conference", "Doyenne"), length.out = n_trees),
+    # climate = factor(rep(1:4, length.out = n_trees))
+  ) %>%
+    mutate(
+      tree_intercept = rnorm(n_trees, mean = 0, sd = sd_tree)
+    )
 
   pear_data <- tree_data %>%
     tidyr::uncount(weights = n_pears_per_tree) %>%
     mutate(
+      pear_id = row_number(),
       epsilon = rnorm(n(), mean = 0, sd = sd_residual),
       quality_index = intercept +
         (species == "Doyenne") * species_eff +
         (climate == 2) * climate_eff +
+        ecotron_effect +
         tree_intercept +
         epsilon
     )
 
   m <- lmer(
-    quality_index ~ species + climate + (1 | tree_id),
+    quality_index ~ species + climate + (1 | ecotr_id / tree_id),
     data = pear_data
   )
 
@@ -118,8 +151,88 @@ run_sim <- function(n_trees) {
   any(p_vals_adj_one_sided < alpha)
 }
 
-power <- sapply(ssizes, function(n) mean(replicate(n_simulations, run_sim(n))))
 
+n_trees_per_ecotron_options <- c(2, 4, 6)  # both species, 6 is max capacity
+n_ecotrons_options <- seq(4, 24, by = 4)   # ecotron simulates one climate, 4 scenarious
+
+power_results <- expand.grid(
+  n_trees_per_ecotron = n_trees_per_ecotron_options,
+  n_ecotrons = n_ecotrons_options,
+  power = NA
+)
+
+N <- nrow(power_results)
+pb <- txtProgressBar(min = 0, max = N, style = 3)
+for (i in seq_len(N)) {
+  print(i)
+  sim_results <- replicate(n_simulations, {
+    run_sim(
+      n_ecotrons = power_results$n_ecotrons[i],
+      n_trees_per_ecotron = power_results$n_trees_per_ecotron[i]
+    )
+  })
+  
+  power_results$power[i] <- mean(sim_results)
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# power <- sapply(ssizes, function(n) mean(replicate(n_simulations, run_sim(n))))
+```
+
+```{r}
+ggplot(power_tbl, aes(x = n_ecotrons, y = power, color = factor(n_trees_per_ecotron))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = target_power, linetype = "dashed", color = "red", linewidth = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = n_ecotrons_options) +
+  scale_color_discrete(name = "Trees per Ecotron") +
+  scale_fill_discrete(name = "Trees per Ecotron") +
+  labs(
+    title = "Power to Detect Climate Effect",
+    subtitle = paste("Climate effect size =", climate_eff, 
+                     "| Target power =", target_power * 100, "%"),
+    x = "Number of Ecotrons",
+    y = "Power"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+power_tbl <- power_results %>%
+  mutate(
+    total_trees = n_ecotrons * n_trees_per_ecotron,
+    meets_target = power >= target_power,
+    power_label = scales::percent(power, accuracy = 0.1)
+  )
+
+ggplot(power_tbl, aes(n_ecotrons, power)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = target_power, linetype = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = ssizes) +
+  labs(
+    x = "Total number of trees",
+    y = "Estimated power"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+```{r}
 power_tbl <- data.frame(
   total_trees = ssizes,
   power = power
@@ -267,24 +380,6 @@ $$
 knitr::kable(param_tbl, align = c("l", "r"))
 ```
 
-## Simulation approach
-
-1. Model the number of observations per tree
-2. Simulate Quality Index ($\text{QI}$) for each pear
-
-$$
-\text{QI}_{it} = \hat\beta_0 + \text{Species}\cdot\hat\beta_{1} + \text{Climate} \cdot \beta_\text{climate} + \hat b_t + \hat\varepsilon_{it}
-$$
-
-- $\text{Species}$ is a dummy variable, specifying Doyenne trees
-- $\text{Climate}$ is a dummy variable, specifying the trees under Climate #2
-- The target effect fixed at $\beta_\text{climate} = 10$
-
-3. Fit the model
-
-$$
-quality\_index \sim species + climate + (1 \mid tree\_id)
-$$
 
 ## Simulation approach
 

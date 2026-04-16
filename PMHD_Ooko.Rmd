@@ -1,0 +1,264 @@
+---
+title: "PMHD Ooko Draft"
+author: "Gruop 16"
+date: "2026-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, include=FALSE}
+
+# -----------------------------
+# 1. Load packages
+# -----------------------------
+packages <- c(
+  "tidyverse",
+  "lme4",
+  "lmerTest",
+  "emmeans",
+  "performance",
+  "DHARMa",
+  "ggplot2",
+   "rsample",
+   "yardstick",
+   "purrr"
+)
+
+installed <- rownames(installed.packages())
+for (p in packages) {
+  if (!p %in% installed) install.packages(p)
+}
+lapply(packages, library, character.only = TRUE)
+```
+
+```{r}
+
+# -----------------------------
+# 2. Read the data
+# -----------------------------
+outcome <- read.csv("C:/Users/guest441/Desktop/Hasselt/PMHD/G16.outcome.data.csv", stringsAsFactors = FALSE)
+size <- read.csv("C:/Users/guest441/Desktop/Hasselt/PMHD/G16.size.data.csv", stringsAsFactors = FALSE)
+soil <- read.csv("C:/Users/guest441/Desktop/Hasselt/PMHD/G16.soil.data.csv", stringsAsFactors = FALSE)
+```
+
+
+
+```{r}
+# -----------------------------
+# 3. Clean and prepare variables
+# -----------------------------
+outcome <- outcome %>%
+  mutate(
+    climate  = factor(climate),
+    species  = factor(species),
+    location = factor(location),
+    ecotr_id = factor(ecotr_id),
+    tree_id  = factor(tree_id),
+    pear_id  = factor(pear_id)
+  )
+
+# Set reference levels
+# Climate reference = Scenario 1 (control/reference condition)
+# Species reference = Conference (change if you prefer the other one)
+
+
+outcome$climate <- relevel(outcome$climate, ref = "Scenario 1")
+outcome$species <- relevel(outcome$species, ref = "Conference")
+
+unique(outcome$climate)
+unique(outcome$species)
+```
+
+```{r}
+
+# -----------------------------
+# 4. Basic exploratory checks
+# -----------------------------
+options(na.print = "NA")
+
+# Sample sizes by climate and species
+sample_table <- table(outcome$climate, outcome$species)
+sample_table
+
+# Number of pears per tree
+pear_counts <- outcome %>%
+  count(ecotr_id, tree_id, climate, species, name = "n_pears") %>%
+  arrange(desc(n_pears))
+
+head(pear_counts, 20)
+
+# Missing values
+missing_summary <- colSums(is.na(outcome))
+missing_summary
+
+# Distribution of quality score
+ggplot(outcome, aes(x = quality_idx)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of Quality Score",
+    x = "Quality Index",
+    y = "Count"
+  )
+
+# Boxplot by climate
+ggplot(outcome, aes(x = climate, y = quality_idx)) +
+  geom_boxplot() +
+  labs(
+    title = "Quality Score by Climate",
+    x = "Climate Scenario",
+    y = "Quality Index"
+  )
+
+# Boxplot by climate and species
+ggplot(outcome, aes(x = climate, y = quality_idx, fill = species)) +
+  geom_boxplot() +
+  labs(
+    title = "Quality Score by Climate and Species",
+    x = "Climate Scenario",
+    y = "Quality Index"
+  )
+
+```
+
+# Inferential model (Should be the primary modedl)
+
+```{r}
+# Set reference categories
+outcome$climate <- relevel(outcome$climate, ref = "Scenario 1")
+outcome$species <- relevel(outcome$species, ref = "Conference")
+
+# Fit model
+m_primary <- lmer(
+  quality_idx ~ climate * species + (1 | tree_id),
+  data = outcome,
+  REML = TRUE
+)
+
+# Output
+summary(m_primary)
+anova(m_primary, type = 3)
+```
+
+# Predictive model (secondary)
+# 5-Fold CV models
+```{r}
+# Set references
+outcome$climate <- relevel(outcome$climate, ref = "Scenario 1")
+outcome$species <- relevel(outcome$species, ref = "Conference")
+
+# Check
+table(outcome$climate, outcome$species)
+```
+
+```{r}
+m_base <- lmer(
+  quality_idx ~ climate * species + (1 | tree_id),
+  data = outcome,
+  REML = TRUE
+)
+
+summary(m_base)
+anova(m_base, type = 3)
+```
+
+```{r}
+set.seed(123)
+
+folds <- group_vfold_cv(
+  outcome,
+  group = tree_id,
+  v = 5
+)
+```
+
+
+```{r}
+candidate_models <- list(
+  m1 = quality_idx ~ climate + species + (1 | tree_id),
+  m2 = quality_idx ~ climate * species + (1 | tree_id)
+)
+```
+
+```{r}
+fit_and_evaluate <- function(split, formula) {
+  
+  train <- analysis(split)
+  test  <- assessment(split)
+  
+  model <- lmer(
+    formula,
+    data = train,
+    REML = FALSE
+  )
+  
+  preds <- predict(
+    model,
+    newdata = test,
+    allow.new.levels = TRUE
+  )
+  
+  tibble(
+    rmse = rmse_vec(test$quality_idx, preds),
+    mae  = mae_vec(test$quality_idx, preds),
+    rsq  = rsq_vec(test$quality_idx, preds)
+  )
+}
+```
+
+```{r}
+cv_results <- map_dfr(names(candidate_models), function(name) {
+  
+  formula <- candidate_models[[name]]
+  
+  results <- map_dfr(folds$splits, fit_and_evaluate, formula = formula)
+  
+  results %>%
+    mutate(model = name, .before = 1)
+})
+
+cv_results
+```
+
+```{r}
+cv_summary <- cv_results %>%
+  group_by(model) %>%
+  summarise(
+    mean_rmse = mean(rmse),
+    sd_rmse   = sd(rmse),
+    mean_mae  = mean(mae),
+    mean_rsq  = mean(rsq),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_rmse)
+
+cv_summary
+```
+
+```{r}
+best_model_name <- cv_summary %>%
+  slice(1) %>%
+  pull(model)
+
+best_model_name
+```
+
+```{r}
+final_formula <- candidate_models[[best_model_name]]
+
+m_final <- lmer(
+  final_formula,
+  data = outcome,
+  REML = TRUE
+)
+
+summary(m_final)
+```
+
+
+
+
