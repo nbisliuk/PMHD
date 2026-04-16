@@ -1,0 +1,242 @@
+---
+title: "Valeriia-main-analysis"
+output: html_document
+---
+
+```{r setup}
+pacman::p_load(dplyr, tidyr, ggplot2, lmerTest, ggridges, knitr, lattice, DHARMa,
+               performance, see, corrplot)
+data <- read.csv("../data/G16.outcome.data.csv") %>%
+    mutate(quality_binary = if_else(quality_idx >= 65, 1, 0))
+size <- read.csv("../data/G16.size.data.csv")
+soil <- read.csv("../data/G16.soil.data.csv")
+```
+
+# Objectives
+
+**Main**
+
+Investigate the effect of 4 controlled climate scenarios on the quality of pear trees.
+
+**Side**
+
+(a)  Transform the Gaussian outcome ‘quality index’ into a binary outcome (i.e. good quality=1/poor quality=0), with a cut-off at 65, and analyze the effect of the climate conditions on this outcome in a separate model as well, taking the potential confounding related to your experiment into account.  
+
+(b) Analyze the effect of the climate conditions on the ‘size’ of the pears over time, taking into account the potential confounding related to your experiment.
+
+(c) Explore/Visualize the soil condition features with a multivariate method to gain insights into the effect of climate on the pear production. Further information about the soil features are attached in a separate document.
+
+# Exploration
+
+## Basic stats
+
+```{r}
+cat("Pears per climate")
+table(data$climate)
+cat("\nPears per tree summary\n")
+summary(count(data, tree_id)$n)
+```
+```{r}
+data %>% 
+    group_by(climate) %>%
+    summarize(
+        mean = mean(quality_idx, na.rm = TRUE),
+        median = median(quality_idx, na.rm = TRUE),
+        sd = sd(quality_idx, na.rm = TRUE)
+    ) %>% 
+    kable(caption = "Quality Index summary statistics", digits = 2)
+```
+
+```{r}
+par(mfrow = c(2, 3))
+
+hist(count(data, tree_id)$n, main = "Histogram of Pears per tree", xlab = "")
+
+hist(table(data$ecotr_id), main = "Histogram of Pears per ecotron", xlab = "")
+
+hist(data$quality_idx, breaks = 20, xlab = "",
+     main = "Histogram of Quality Index")
+
+boxplot(quality_idx ~ climate, data, xlab = "", ylab = "Quality Index",
+        main = "Quality Index per climate")
+
+boxplot(quality_idx ~ species, data, xlab = "", ylab = "Quality Index",
+        main = "Quality Index per species")
+
+boxplot(quality_idx ~ ecotr_id, data, xlab = "", ylab = "Quality Index",
+        main = "Quality Index per ecotron")
+```
+
+- The counts of pears per tree form a bell-shaped density, which is exactly matches our approach to modelling the random number of trees
+- The number of fruits under different climates as well as the number of fruits yielded from an ecotron slightly varies >> test whether the number pears varies significantly between ecotrons (just out of curiosity, the main analysis won't be affected much regardless of the result)
+- !CONCERNING! a spike in 'perfect quality pears' (see "Histogram if Quality Index")
+- Slight variability in Quality Index between climates / species / ecotrons
+
+## Is the number of pears different under different climates?
+
+```{r}
+ecotron_pears <- data %>% 
+    group_by(ecotr_id) %>% 
+    summarize(
+        climate = first(climate),
+        pears = n()
+    )
+kruskal.test(pears ~ climate, data = ecotron_pears)
+pairwise.wilcox.test(ecotron_pears$pears, ecotron_pears$climate, p.adjust.method = "BH")
+```
+
+Kruskal-Wallis test indicated a sinificant difference in the number of pears grown under at least one climate. However, post-hoc pairwise Wilcoxon rank sum test with BH correction did not produce any significant results at $0.05$ significance level. Hence, the number of pears is comparable between climates.
+
+# Main: Quality index
+
+$$
+\text{Quality Index}_{ijt} = \beta_0 + \sum_j\beta_j \cdot \text{Climate}_j + \beta_1 \cdot \text{Species} + b_t + \varepsilon_{ijt} \\
+\\
+b_t \sim N(0, \sigma_\text{tree}^2) \\
+\varepsilon_{ijt} \sim N(0, \sigma_\text{resid}^2)
+$$
+
+```{r fig.height=16, fig.width=16}
+m1 <- lmer(quality_idx ~ climate + species + (1 | tree_id), data)
+summary(m1)
+check_model(m1)
+```
+
+```{r fig.width=16, fig.height=8}
+sim_res <- simulateResiduals(m1)
+plot(sim_res)
+```
+
+- QQ plot: Probability Integral Transform (PIT) residuals are in check, uniformly distributed
+- KS: Probability Integral Transform (PIT) residuals are in check, uniformly distributed
+- Dispersion test: no overdispersion detected
+- Outlier test: more outliers than expected (counld be attributed to a perfect-score bump)
+- Residual vs. Predicted plot + Levene Test: linearity and homoscedascity assumptions are in check
+
+
+```{r fig.width=16, fig.height=8}
+outliers <- which(sim_res$scaledResiduals < 0.025 | sim_res$scaledResiduals > 0.975)
+data[outliers, ]
+```
+
+# (a) Binary quality outcome
+
+```{r}
+m2 <- glmer(quality_binary ~ climate + species + (1 | tree_id),
+           data = data,
+           family = binomial)
+summary(m2)
+```
+
+```{r}
+exp(fixef(m2))
+```
+
+```{r}
+sim_res <- simulateResiduals(m2)
+plot(sim_res)
+```
+
+# (b) Pear size
+
+```{r}
+size_long <- size %>%
+  pivot_longer(
+    cols = starts_with("week_"), 
+    names_to = "week", 
+    names_prefix = "week_",
+    values_to = "size_val"
+  ) %>%
+  mutate(week = as.numeric(week))
+
+# 2. Plot growth curves
+ggplot(size_long, aes(x = week, y = size_val, color = climate, group = pear_id)) +
+  geom_line(alpha = 0.8, na.rm = TRUE) + # Individual pear trajectories (semi-transparent)
+  #geom_smooth(aes(group = climate), method = "loess", size = 1.2) + # Average trend per climate
+  labs(
+    title = "Pear Size Growth by Climate",
+    x = "Week Number",
+    y = "Size",
+    color = "Climate Type"
+  ) +
+    facet_wrap(~climate) +
+  theme_minimal()
+```
+
+Seem quite linear
+
+```{r}
+m3 <- lmer(size_val ~ week * climate + species + (1 | tree_id / pear_id), 
+           data = size_long)
+summary(m3)
+```
+```{r fig.height=16}
+check_model(m3)
+```
+
+```{r fig.width=12}
+plot(simulateResiduals(m3))
+```
+
+# (c) Soil features
+
+```{r fig.height=5, fig.width=7, warning=FALSE}
+library(FactoMineR)
+library(factoextra)
+
+soil_numeric <- soil[, 7:23]
+res.pca <- PCA(soil_numeric, graph = FALSE, scale.unit = TRUE)
+```
+
+```{r fig.height=5, fig.width=7, warning=FALSE}
+fviz_eig(res.pca, addlabels = TRUE)
+```
+
+```{r}
+fviz_cos2(res.pca, choice = "var", axes = 1:2)
+```
+
+```{r fig.width=7, fig.height=5}
+var_pc_corr <- get_pca_var(res.pca)$cor
+var_pc_corr <- var_pc_corr[order(var_pc_corr[,1], decreasing = TRUE), ]
+
+corrplot(var_pc_corr)
+mtext("Cos2 of variables to Dims", at=-3.5, line=2.5)
+```
+
+```{r}
+fviz_contrib(res.pca, choice = "var", axes = 1:2)
+```
+
+```{r fig.width=7, fig.height=5}
+var_pc_contrib <- get_pca_var(res.pca)$contrib
+var_pc_contrib <- var_pc_contrib[order(var_pc_contrib[,1], decreasing = TRUE), ]
+corrplot(var_pc_contrib, is.corr=FALSE)
+mtext("Contributions of variables to PCs", at=-4.5, line=2.5)
+```
+
+
+```{r fig.width=9, fig.height=9}
+# 3. Visualize the 'Individual' plot colored by Climate
+fviz_pca_ind(res.pca,
+             geom.ind = "point", 
+             col.ind = soil$climate,
+             palette = "jco",
+             addEllipses = TRUE,
+             #ellipse.type = "confidence",
+             ellipse.type = "convex",
+             legend.title = "Climate")
+```
+
+
+```{r fig.width=9, fig.height=9}
+# 4. Visualize the 'Variables' plot to see which soil features drive the differences
+fviz_pca_var(res.pca, col.var = "contrib", 
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE)
+```
+
+```{r}
+fviz_pca_biplot(res.pca, repel = TRUE, col.ind = soil$climate, palette = "jco")
+```
+
