@@ -5,7 +5,7 @@ output: html_document
 
 ```{r setup}
 pacman::p_load(dplyr, tidyr, ggplot2, lmerTest, ggridges, knitr, lattice, DHARMa,
-               performance, see, corrplot)
+               performance, see, corrplot, lmtest, car, AER)
 data <- read.csv("../data/G16.outcome.data.csv") %>%
     mutate(quality_binary = if_else(quality_idx >= 65, 1, 0))
 size <- read.csv("../data/G16.size.data.csv")
@@ -16,7 +16,7 @@ soil <- read.csv("../data/G16.soil.data.csv")
 
 **Main**
 
-Investigate the effect of 4 controlled climate scenarios on the quality of pear trees.
+Investigate the effect of 4 controlled climate scenarios on the quality of pears.
 
 **Side**
 
@@ -97,9 +97,14 @@ b_t \sim N(0, \sigma_\text{tree}^2) \\
 $$
 
 ```{r fig.height=16, fig.width=16}
-m1 <- lmer(quality_idx ~ climate + species + (1 | tree_id), data)
+m1 <- lmer(quality_idx ~ climate*species + (1 | tree_id), data, REML = FALSE)
 summary(m1)
 check_model(m1)
+```
+
+```{r fig.height=5, fig.width=7}
+m1 <- lm(quality_idx ~ climate + species, data)
+qqPlot(resid(m1), main = "Linear Model Residuals Q-Q Plot", envelope = 0.95)
 ```
 
 ```{r fig.width=16, fig.height=8}
@@ -119,10 +124,85 @@ outliers <- which(sim_res$scaledResiduals < 0.025 | sim_res$scaledResiduals > 0.
 data[outliers, ]
 ```
 
+## Beta reg
+
+```{r}
+data <- data %>% mutate(quality_idx_perc = quality_idx / 100)
+m1_beta <- betareg(quality_idx_perc ~ climate*species,
+                   dist = "xbetax", data)
+summary(m1_beta)
+```
+
+```{r}
+par(mfrow = c(1, 2), oma = c(0, 0, 3, 0))
+res_pearson <- residuals(m1_beta, type = "pearson")
+fitted_vals <- fitted(m1_beta)
+plot(fitted_vals, res_pearson,
+     xlab = "Fitted values",
+     ylab = "Pearson residuals")
+abline(h = 0, col = "hotpink")
+
+qqnorm(res_pearson)
+qqline(res_pearson, col = "hotpink")
+mtext("m1_beta diagnostics", side = 3, outer = TRUE, font = 2, cex = 1.5)
+
+sum(residuals(m1_beta, type="pearson")^2) / df.residual(m1_beta)
+```
+**Interaction**
+The inclusion of an interaction term lowers AIC by 3.65 points. 
+```{r}
+m1_beta_no_int <- update(m1_beta, . ~ climate + species)
+AIC(m1_beta, m1_beta_no_int)
+```
+
+**Heteroscedasticity**
+Likelihood ratio test shows no evidence that adding a precision parameter $\phi$ improves the fit. This conclusion is further supported by comparing the AIC estimators of the constant precision model and the models accounting for possible heteroscedasticity.
+
+```{r}
+m_const <- m1_beta
+m_clim  <- update(m1_beta, . ~ . | climate)
+m_spec  <- update(m1_beta, . ~ . | species)
+m_full  <- update(m1_beta, . ~ . | climate + species)
+
+AIC(m_const, m_clim, m_spec, m_full)
+lrtest(m_const, m_clim, m_spec, m_full)
+```
+
+```{r}
+plot(m1_beta, which = c(1, 4))
+
+```
+
+**Multicollinearity**
+Adjusted GVIF is in check for all the regression terms.
+
+```{r}
+vif(m1_beta)
+```
+
+```{r}
+sim_res <- simulateResiduals(m1_beta)
+plot(sim_res)
+```
+
+## Tobit
+
+```{r}
+m1_tobit <- tobit(quality_idx ~ climate*species, data = data,
+                  left = -Inf, right = 100)
+summary(m1_tobit)
+```
+
+```{r}
+sim_res <- simulateResiduals(m1_tobit)
+plot(sim_res)
+```
+
+
 # (a) Binary quality outcome
 
 ```{r}
-m2 <- glmer(quality_binary ~ climate + species + (1 | tree_id),
+m2 <- glmer(quality_binary ~ climate * species + (1 | tree_id),
            data = data,
            family = binomial)
 summary(m2)
@@ -166,7 +246,7 @@ ggplot(size_long, aes(x = week, y = size_val, color = climate, group = pear_id))
 Seem quite linear
 
 ```{r}
-m3 <- lmer(size_val ~ week * climate + species + (1 | tree_id / pear_id), 
+m3 <- lmer(size_val ~ week * climate + species + climate:species+ (1 | tree_id / pear_id), 
            data = size_long)
 summary(m3)
 ```
