@@ -1,0 +1,182 @@
+---
+title: "RQ1-continuous-quality-idx"
+output: html_document
+---
+
+```{r setup}
+pacman::p_load(dplyr, tidyr, ggplot2, lmerTest, car, gtsummary, emmeans, gt)
+data <- read.csv("../data/G16.outcome.data.csv") %>%
+    mutate(quality_binary = if_else(quality_idx >= 65, 1, 0))
+knitr::opts_chunk$set(fig.width = 7, fig.height = 7)
+```
+
+# Methods
+
+Model assumptions were evaluated using standard diagnostic procedures for linear mixed-effects models. Residual diagnostics included inspection of residuals versus fitted values to assess homoscedasticity and linearity assumptions, and quantile–quantile (Q–Q) plots to evaluate normality of residuals and random effects. Multicollinearity among fixed effects was assessed using Generalized variance inflation factors (GVIFs). Model stability and fit were further evaluated by comparing alternative model specifications and checking for convergence warnings.
+
+# Model specification
+
+$$
+Y_{klji} = \mu + \beta^C_k+\beta^S_l+\beta^{CS}_{kl}+b_j+\epsilon_{klji} \\
+\epsilon_{klji} \sim N\big(0, \sigma^2_\text{resid}\big) \\
+b_{j} \sim N\big(0, \sigma^2_\text{tree}\big)
+$$
+
+The response variable $Y_{klji}$ represents the quality index of pear $i$ measured on tree $j$, under climate level $k$ and species $l$. The model includes fixed effects for climate $\beta^C_k$, species $\beta^S_l$, and their interaction $\beta^{CS}_{kl}$, allowing the effect of climate to differ between species. A random intercept $b_j$ is included to account for variability between trees, capturing unobserved tree-specific effects. The residual term $\epsilon_{klji}$ represents within-tree variability. Overall, this is a linear mixed-effects model with a factorial fixed-effects structure and random intercepts for trees.
+
+The initial model considered an extended specification including a random effect for ecotron. However, a convergence issue was encountered when fitting the mixed-effects model, so a simplified random-effects structure was adopted.
+
+
+```{r fig.width=12, fig.height=12}
+m1_mixed <- lmer(
+  quality_idx ~ climate * species + (1 | tree_id),
+  data = data
+)
+```
+
+# Assessing model assumptions
+
+```{r warning=FALSE, fig.height=8, fig.width=8}
+par(mfrow = c(2, 2))
+resids <- residuals(m1_mixed, type = "pearson")
+fitvals <- fitted(m1_mixed)
+hatvals <- hatvalues(m1_mixed)
+
+plot(fitvals, resids, main = "Linearity",
+     xlab = "Fitted values", ylab = "Pearson residuals")
+abline(h = 0, col = "hotpink", lwd = 2)
+
+plot(fitvals, sqrt(resids), main = "Homoscedasticity",
+     xlab = "Fitted values", ylab = "Square root of Pearson residuals")
+abline(h = 0, col = "hotpink", lwd = 2)
+
+qqnorm(resids, main = "Normality of residuals")
+qqline(resids, col = "hotpink", lwd = 2)
+
+tree_rand_eff <- ranef(m1_mixed)$tree_id[,1]
+qqnorm(tree_rand_eff, main = "Normality of tree random effects")
+qqline(tree_rand_eff, col = "hotpink", lwd = 2)
+```
+
+
+```{r warning=FALSE, fig.height=8, fig.width=8}
+vif(m1_mixed)
+```
+The residuals versus fitted values plot showed no systematic pattern, with residuals evenly distributed around zero, suggesting no violations of linearity. Homoscedasticity is satisfied, although the scale–location plot indicates a slight increase in variability at higher fitted values.
+
+Assessment of normality revealed that residuals were approximately normally distributed, with mild deviations at the tails from the diagonal line in the Q–Q plot. The distribution of random effects closely followed normality in the corresponding Q–Q plot.
+
+Overall, these minor deviations are unlikely to affect inference, as linear mixed-effects models are generally robust to small violations of normality.
+
+The adjusted Generalized Variance Inflation Factor (GVIF) values for all the regression terms are lower than 2.5 signaling low collinearity within the model.
+
+We assessed for influential points via  Cook’s distance plots. Most of the observations exceeding the threshold  observations …….
+
+A linear mixed-effects framework was considered appropriate for modelling the continuous pear quality index. Alternative approaches, such as extended-support beta regression with a transformed response or censored regression models, could be considered to explicitly account for the slight inflation at the boundary values (0 and 100), but were not pursued further.
+
+```{r warning=FALSE, fig.height=8, fig.width=8}
+plot(hatvals, resids, main = "Influential observations: Leverage",
+     xlab = "Leverage", ylab = "Residuals")
+
+cooks_dist <- cooks.distance(m1_mixed)
+plot(cooks_dist, type = "h",
+     main = "Influential observations: Cook's distance",
+     ylab = "Cook's distance")
+abline(h = 4/length(cooks_dist), col = "hotpink", lwd = 2)
+
+
+leveragePlot(m1_mixed)
+```
+
+# Results
+
+## Interpret the model
+
+```{r}
+gtsummary::tbl_regression(m1_mixed) %>% 
+    #add_glance_source_note() %>% 
+    add_vif() %>% 
+    bold_p(0.01) %>% 
+    remove_abbreviation() %>% 
+    as_gt() %>%
+    gt::gtsave("../submission/m1_mixed_summary_with_vif.png")
+```
+
+```{r}
+summary(m1_mixed)
+```
+
+The variation between trees is small compared to the within tree variability. Despite that the random effect accounts only for 0.6\% of the total variability, it is still valid structurally to account for clustering in the data.
+
+The only significant climate main effect corresponds to Scenario 2. Doyenne species exhibit a strongly significant and negative effect on the pear quality. In addition, for Doyenne, climate Scenario 3 results in 9.7 increase relative to reference species. In conclusion, climate effects depend on the species and cannot be interpreted in isolation.
+
+## Test `+10 points in at least one climate` hypothesis
+
+$$
+H_0: \mu_{\text{Scenario k}}-\mu_{\text{Scenario 1}} < 10 \\
+H_a: \mu_{\text{Scenario k}}-\mu_{\text{Scenario 1}} >= 10
+$$
+
+
+```{r}
+Anova(m1_mixed, type = "III")
+```
+
+```{r}
+emm <- emmeans(m1_mixed, ~ climate | species)
+emm
+```
+
+The Table ?? shows the estimated marginal means for all the combinations between fixed effect levels separately for Doyenne and Conference species. The only climate scenario to show an at least 10 point increase is Scenario 3. There is an absolute difference of 11.6 quality index points between the reference climate and the third one.
+
+
+```{r}
+contr <- contrast(emm, method = "trt.vs.ctrl", ref = "Scenario 1",
+                  adjust = "sidak")
+res <- test(contr, null = 10, side = ">=")
+res
+```
+
+One-sided tests were conducted to assess whether any climate scenario improved quality by at least 10 units relative to Scenario 1. After Šidák adjustment for multiple comparisons, no contrasts were statistically significant. Although Scenario 3 for Doyenne pears showed an estimated increase of 11.6 units, this effect was not statistically distinguishable from the 10-unit threshold (p = 0.91), indicating insufficient evidence to conclude that the study reaches primary endpoint.
+
+
+```{r}
+data.frame(res) %>%
+  mutate(
+    across(c(estimate, SE, df, t.ratio), ~ round(.x, digits = 2))
+  ) %>% 
+  gt(groupname_col = "species") %>%
+  
+  # 1. Bold the column headers
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  
+  # 2. Indent AND prevent wrapping
+  tab_style(
+    style = list(
+      cell_text(indent = px(20)),
+      "white-space: nowrap" # This prevents the text from jumping to the next line
+    ),
+    locations = cells_body(columns = contrast)
+  ) %>%
+
+  # Your existing styles
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      columns = estimate,
+      rows = estimate >= 10
+    )) %>% 
+  fmt_number(columns = "p.value", decimals = 3) %>% 
+  cols_label(
+    contrast = "",
+    estimate = "Estimate",
+    SE = "SE",
+    t.ratio = "t",
+    p.value = "p-value"
+  ) %>% 
+    gtsave("../submission/m1_mixed_contrasts.png")
+```
+
